@@ -497,75 +497,79 @@ function arr(c){ return c>=0?'▲ ':'▼ '; }
 // ══════════════════════════════════════════════
 // FETCH
 // ══════════════════════════════════════════════
-async function fetchYahooQuote(syms){
-  if(!syms.length) return {};
-  // Use v7 quote endpoint — more reliable for stocks & indices
-  const url=`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(syms.join(','))}&fields=regularMarketPrice,regularMarketChangePercent,regularMarketPreviousClose,fiftyDayAverage`;
-  const proxy=`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
-  try{
-    const r=await fetch(proxy), j=await r.json();
-    const data=JSON.parse(j.contents);
-    const res={};
-    const results=data?.quoteResponse?.result||[];
-    for(const q of results){
-      const sym=q.symbol;
-      // Piyasa kapalıysa preMarket veya previousClose kullan
-      const price = q.regularMarketPrice
-        || q.preMarketPrice
-        || q.postMarketPrice
-        || q.regularMarketPreviousClose
-        || null;
-      const chg1d = q.regularMarketChangePercent
-        || q.preMarketChangePercent
-        || 0;
+// Multiple proxies to try
+const PROXIES = [
+  url => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
+  url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+  url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+];
+
+async function proxyFetch(url) {
+  // Try allorigins first (wraps response in {contents})
+  try {
+    const proxy = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
+    const r = await fetch(proxy, {signal: AbortSignal.timeout(10000)});
+    if (r.ok) {
+      const j = await r.json();
+      if (j.contents) return JSON.parse(j.contents);
+    }
+  } catch(e) {}
+
+  // Try corsproxy.io (returns raw JSON)
+  try {
+    const proxy = `https://corsproxy.io/?${encodeURIComponent(url)}`;
+    const r = await fetch(proxy, {signal: AbortSignal.timeout(10000)});
+    if (r.ok) return await r.json();
+  } catch(e) {}
+
+  // Try thingproxy
+  try {
+    const proxy = `https://thingproxy.freeboard.io/fetch/${url}`;
+    const r = await fetch(proxy, {signal: AbortSignal.timeout(10000)});
+    if (r.ok) return await r.json();
+  } catch(e) {}
+
+  return null;
+}
+
+async function fetchYahoo(syms) {
+  if (!syms.length) return {};
+  const res = {};
+
+  // Try v7 quote (works for stocks, indices, forex)
+  try {
+    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(syms.join(','))}&fields=regularMarketPrice,regularMarketChangePercent,regularMarketPreviousClose,preMarketPrice,preMarketChangePercent,postMarketPrice,marketState,fiftyDayAverage`;
+    const data = await proxyFetch(url);
+    const results = data?.quoteResponse?.result || [];
+    for (const q of results) {
+      const price = q.regularMarketPrice || q.preMarketPrice || q.postMarketPrice || q.regularMarketPreviousClose;
+      const chg1d = q.regularMarketChangePercent || q.preMarketChangePercent || 0;
       const prev = q.regularMarketPreviousClose || price;
-      const chg1w = prev && q.fiftyDayAverage
-        ? ((price - prev) / prev * 5)
-        : 0;
-      const marketState = q.marketState || 'CLOSED';
-      if(price) res[sym]={price, chg1d, chg1w, marketState};
+      const chg1w = (prev && price) ? ((price - prev) / prev * 5) : 0;
+      if (price) res[q.symbol] = {price, chg1d, chg1w, marketState: q.marketState || 'CLOSED'};
     }
-    return res;
-  }catch(e){ return {}; }
-}
+  } catch(e) {}
 
-async function fetchYahooSpark(syms){
-  if(!syms.length) return {};
-  const url=`https://query2.finance.yahoo.com/v8/finance/spark?symbols=${encodeURIComponent(syms.join(','))}&range=8d&interval=1d`;
-  const proxy=`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
-  try{
-    const r=await fetch(proxy), j=await r.json();
-    const data=JSON.parse(j.contents);
-    const res={};
-    for(const sym of syms){
-      try{
-        const s=data.spark.result?.find(x=>x.symbol===sym);
-        if(!s) continue;
-        const c=s.response[0].indicators.quote[0].close.filter(Boolean);
-        if(c.length<2) continue;
-        const p=c[c.length-1],prev=c[c.length-2],prev5=c[Math.max(0,c.length-6)];
-        res[sym]={price:p,chg1d:(p-prev)/prev*100,chg1w:(p-prev5)/prev5*100};
-      }catch(e){}
-    }
-    return res;
-  }catch(e){return{};}
-}
+  // For any missing, try spark API
+  const missing = syms.filter(s => !res[s]);
+  if (missing.length) {
+    try {
+      const url = `https://query2.finance.yahoo.com/v8/finance/spark?symbols=${encodeURIComponent(missing.join(','))}&range=8d&interval=1d`;
+      const data = await proxyFetch(url);
+      for (const sym of missing) {
+        try {
+          const s = data?.spark?.result?.find(x => x.symbol === sym);
+          if (!s) continue;
+          const c = s.response[0].indicators.quote[0].close.filter(Boolean);
+          if (c.length < 2) continue;
+          const p=c[c.length-1], prev=c[c.length-2], prev5=c[Math.max(0,c.length-6)];
+          res[sym] = {price:p, chg1d:(p-prev)/prev*100, chg1w:(p-prev5)/prev5*100, marketState:'CLOSED'};
+        } catch(e) {}
+      }
+    } catch(e) {}
+  }
 
-async function fetchYahoo(syms){
-  if(!syms.length) return {};
-  // Try v7 quote first (more reliable), fallback to spark
-  const [quoteData, sparkData] = await Promise.all([
-    fetchYahooQuote(syms),
-    fetchYahooSpark(syms)
-  ]);
-  // Merge: prefer quote data, fallback to spark
-  const merged={};
-  syms.forEach(sym=>{
-    merged[sym] = quoteData[sym] || sparkData[sym] || null;
-  });
-  // Remove nulls
-  Object.keys(merged).forEach(k=>{ if(!merged[k]) delete merged[k]; });
-  return merged;
+  return res;
 }
 
 async function fetchCG(ids){
